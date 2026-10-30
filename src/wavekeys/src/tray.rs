@@ -169,6 +169,8 @@ fn pump_messages() {
     }
 }
 
+type MixDiscoveryResult = Result<Vec<(String, String)>, String>;
+
 pub(crate) struct SettingsApp {
     config: Config,
     saved_config: Config,
@@ -177,6 +179,9 @@ pub(crate) struct SettingsApp {
     save_receiver: Option<mpsc::Receiver<SaveResult>>,
     accent: egui::Color32,
     close_requested: bool,
+    mixes: Vec<(String, String)>,
+    mix_receiver: Option<mpsc::Receiver<MixDiscoveryResult>>,
+    mix_error: Option<String>,
 }
 
 struct SaveResult {
@@ -200,7 +205,7 @@ impl SettingsApp {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        Self {
+        let mut app = Self {
             saved_config: config.clone(),
             config,
             autostart,
@@ -208,6 +213,78 @@ impl SettingsApp {
             save_receiver: None,
             accent: windows_accent(),
             close_requested: false,
+            mixes: Vec::new(),
+            mix_receiver: None,
+            mix_error: None,
+        };
+        app.refresh_mixes();
+        app
+    }
+
+    fn refresh_mixes(&mut self) {
+        if self.mix_receiver.is_some() {
+            return;
+        }
+        let config = self.config.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime.block_on(async {
+                    let endpoint = if config.endpoint == "auto" {
+                        wavekeys_core::wavelink::discover_endpoint()
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        config.endpoint
+                    };
+                    let mut client = wavekeys_core::wavelink::WaveLinkClient::connect(
+                        &endpoint,
+                        Duration::from_millis(config.rpc_timeout_ms),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let response = client
+                        .call("getMixes", serde_json::Value::Null)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mixes = response
+                        .get("mixes")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or("Missing mix list")?;
+                    Ok(mixes
+                        .iter()
+                        .filter_map(|mix| {
+                            Some((
+                                mix.get("id")?.as_str()?.to_owned(),
+                                mix.get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("Mix")
+                                    .to_owned(),
+                            ))
+                        })
+                        .collect())
+                })
+            })();
+            let _ = sender.send(result);
+        });
+        self.mix_receiver = Some(receiver);
+        self.mix_error = None;
+    }
+
+    fn poll_mixes(&mut self) {
+        let result = match self.mix_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("Mix discovery stopped".into()),
+            _ => return,
+        };
+        self.mix_receiver = None;
+        match result {
+            Ok(mixes) => self.mixes = mixes,
+            Err(error) => self.mix_error = Some(error),
         }
     }
 
@@ -282,6 +359,7 @@ impl SettingsApp {
 impl SettingsApp {
     pub(crate) fn show(&mut self, ctx: &egui::Context) {
         self.poll_save();
+        self.poll_mixes();
         egui_extras::install_image_loaders(ctx);
         ctx.set_visuals(egui::Visuals::dark());
         ctx.style_mut(|style| {
@@ -371,195 +449,273 @@ impl SettingsApp {
                     .inner_margin(egui::Margin::same(22)),
             )
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Media controls").size(20.0).strong());
-                ui.label(
-                    egui::RichText::new("Control the focused app or an entire Wave Link mix.")
-                        .color(egui::Color32::GRAY),
-                );
-                ui.add_space(16.0);
-                settings_group(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label("Step size");
-                    percent_slider(ui, &mut self.config.step_percent, 0.1..=100.0, 1.0)
-                        .on_hover_text("Volume change per key press");
-                });
-                ui.add_space(8.0);
-                settings_group(ui, |ui| {
-                    ui.label("Target mix");
-                    egui::ComboBox::from_id_salt("mix")
-                        .width(128.0)
-                        .selected_text(
-                            egui::RichText::new(match self.config.target_mix {
-                                MixTarget::Monitor => "Personal Mix",
-                                MixTarget::Stream => "Stream Mix",
-                                MixTarget::Chat => "Chat Mix",
-                            })
-                            .color(egui::Color32::WHITE),
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.target_mix,
-                                MixTarget::Monitor,
-                                "Personal Mix",
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Media controls").size(20.0).strong());
+                        ui.label(
+                            egui::RichText::new(
+                                "Control the focused app or an entire Wave Link mix.",
                             )
-                            .on_hover_text("Local Personal Mix");
-                            ui.selectable_value(
-                                &mut self.config.target_mix,
-                                MixTarget::Chat,
-                                "Chat Mix",
-                            )
-                            .on_hover_text("Wave Link Chat Mix");
-                            ui.selectable_value(
-                                &mut self.config.target_mix,
-                                MixTarget::Stream,
-                                "Stream Mix",
-                            )
-                            .on_hover_text("Wave Link Stream Mix");
+                            .color(egui::Color32::GRAY),
+                        );
+                        ui.add_space(16.0);
+                        settings_group(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label("Step size");
+                            percent_slider(ui, &mut self.config.step_percent, 0.1..=100.0, 1.0)
+                                .on_hover_text("Volume change per key press");
                         });
-                    ui.add_space(5.0);
-                    ui.label("Control scope");
-                    egui::ComboBox::from_id_salt("scope")
-                        .width(128.0)
-                        .selected_text(
-                            egui::RichText::new(match self.config.control_scope {
-                                ControlScope::Focus => "Focused app",
-                                ControlScope::Global => "Global",
-                            })
-                            .color(egui::Color32::WHITE),
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.control_scope,
-                                ControlScope::Focus,
-                                "Focused app",
-                            )
-                            .on_hover_text("Control only the channel assigned to the focused app");
-                            ui.selectable_value(
-                                &mut self.config.control_scope,
-                                ControlScope::Global,
-                                "Global",
-                            )
-                            .on_hover_text("Control the entire selected mix, independent of focus");
-                        });
-                });
-                ui.add_space(8.0);
-                settings_group(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label("Volume overlay");
-                    accent_checkbox(
-                        ui,
-                        self.accent,
-                        &mut self.config.overlay_enabled,
-                        "Show volume overlay",
-                    )
-                    .on_hover_text("Show the confirmed Wave Link level after a volume change");
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        accent_checkbox(
-                            ui,
-                            self.accent,
-                            &mut self.config.overlay_show_target_name,
-                            "Show channel or mix name",
-                        )
-                    })
-                    .inner
-                    .on_hover_text("Display the affected target above the level");
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        ui.label("Scale");
-                        percent_slider(ui, &mut self.config.overlay_scale, 0.5..=2.0, 100.0)
-                    })
-                    .inner
-                    .on_hover_text("Resize the overlay from 50% to 200%");
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        ui.label("Icon size");
-                        percent_slider(ui, &mut self.config.overlay_icon_scale, 0.5..=1.5, 100.0)
-                    })
-                    .inner
-                    .on_hover_text("Resize only the channel or mix icon");
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        ui.label("Text size");
-                        percent_slider(ui, &mut self.config.overlay_font_scale, 0.5..=1.5, 100.0)
-                    })
-                    .inner
-                    .on_hover_text("Resize the overlay name and percentage");
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        ui.label("Font");
-                        egui::ComboBox::from_id_salt("overlay-font")
-                            .width(168.0)
-                            .selected_text(
-                                egui::RichText::new(font_display_name(
-                                    &self.config.overlay_font_family,
-                                ))
-                                .color(egui::Color32::WHITE),
-                            )
-                            .height(260.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.config.overlay_font_family,
-                                    "system".to_owned(),
-                                    "Windows default",
-                                );
-                                for font in installed_fonts() {
+                        ui.add_space(8.0);
+                        settings_group(ui, |ui| {
+                            ui.label("Target mix");
+                            egui::ComboBox::from_id_salt("mix")
+                                .width(128.0)
+                                .selected_text(
+                                    egui::RichText::new(match self.config.target_mix {
+                                        MixTarget::Monitor => "Personal Mix",
+                                        MixTarget::Stream => "Stream Mix",
+                                        MixTarget::Chat => "Chat Mix",
+                                    })
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .show_ui(ui, |ui| {
                                     ui.selectable_value(
-                                        &mut self.config.overlay_font_family,
-                                        font.name.clone(),
-                                        &font.name,
-                                    );
+                                        &mut self.config.target_mix,
+                                        MixTarget::Monitor,
+                                        "Personal Mix",
+                                    )
+                                    .on_hover_text("Local Personal Mix");
+                                    ui.selectable_value(
+                                        &mut self.config.target_mix,
+                                        MixTarget::Chat,
+                                        "Chat Mix",
+                                    )
+                                    .on_hover_text("Wave Link Chat Mix");
+                                    ui.selectable_value(
+                                        &mut self.config.target_mix,
+                                        MixTarget::Stream,
+                                        "Stream Mix",
+                                    )
+                                    .on_hover_text("Wave Link Stream Mix");
+                                });
+                            if self.config.control_scope == ControlScope::Global {
+                                ui.add_space(5.0);
+                                ui.label("Global mixes (leave empty to use Target mix)");
+                                for (id, name) in &self.mixes {
+                                    let mut selected = self.config.target_mix_ids.contains(id);
+                                    if ui
+                                        .checkbox(&mut selected, format!("{name} ({id})"))
+                                        .changed()
+                                    {
+                                        if selected {
+                                            self.config.target_mix_ids.push(id.clone());
+                                        } else {
+                                            self.config
+                                                .target_mix_ids
+                                                .retain(|selected_id| selected_id != id);
+                                        }
+                                    }
                                 }
-                            });
-                    });
-                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
-                        ui.label("Hide delay");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.overlay_hide_delay_seconds)
-                                .range(0.1..=10.0)
-                                .speed(0.1)
-                                .fixed_decimals(1)
-                                .suffix(" s"),
-                        )
-                    })
-                    .inner
-                    .on_hover_text("Seconds after the last volume change; decimals are allowed");
-                });
-                ui.add_space(8.0);
-                let save_clicked = ui
-                    .horizontal(|ui| {
-                        accent_checkbox(ui, self.accent, &mut self.autostart, "Start with Windows")
-                            .on_hover_text("Start automatically after signing in to Windows");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if footer_link_button(
+                                for id in self.config.target_mix_ids.clone() {
+                                    if !self.mixes.iter().any(|mix| mix.0 == id)
+                                        && ui
+                                            .button(format!("Remove unavailable mix: {id}"))
+                                            .clicked()
+                                    {
+                                        self.config
+                                            .target_mix_ids
+                                            .retain(|selected_id| selected_id != &id);
+                                    }
+                                }
+                                if self.mix_receiver.is_some() {
+                                    ui.label("Loading mixes...");
+                                    ctx.request_repaint_after(Duration::from_millis(200));
+                                }
+                                if let Some(error) = &self.mix_error {
+                                    ui.label(format!("Could not load mixes: {error}"));
+                                }
+                                if ui.button("Refresh mixes").clicked() {
+                                    self.refresh_mixes();
+                                }
+                            }
+                            ui.add_space(5.0);
+                            ui.label("Control scope");
+                            egui::ComboBox::from_id_salt("scope")
+                                .width(128.0)
+                                .selected_text(
+                                    egui::RichText::new(match self.config.control_scope {
+                                        ControlScope::Focus => "Focused app",
+                                        ControlScope::Global => "Global",
+                                    })
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.config.control_scope,
+                                        ControlScope::Focus,
+                                        "Focused app",
+                                    )
+                                    .on_hover_text(
+                                        "Control only the channel assigned to the focused app",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.config.control_scope,
+                                        ControlScope::Global,
+                                        "Global",
+                                    )
+                                    .on_hover_text(
+                                        "Control the entire selected mix, independent of focus",
+                                    );
+                                });
+                        });
+                        ui.add_space(8.0);
+                        settings_group(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label("Volume overlay");
+                            accent_checkbox(
                                 ui,
                                 self.accent,
-                                egui::include_image!("../assets/github.svg"),
-                                "WaveKeys on GitHub",
-                                18.0,
-                            ) {
-                                open_url("https://github.com/Wuerfelhusten/WaveKeys");
-                            }
-                            if footer_link_button(
-                                ui,
-                                self.accent,
-                                egui::include_image!("../assets/kofi.svg"),
-                                "Ko-fi: wuerfelhusten",
-                                19.8,
-                            ) {
-                                open_url("https://ko-fi.com/wuerfelhusten");
-                            }
-                            ui.add_space(6.0);
-                            let saving = self.save_receiver.is_some();
-                            ui.add_enabled(
-                                self.is_dirty() && !saving,
-                                egui::Button::new(if saving { "Saving..." } else { "Save" })
-                                    .min_size(egui::vec2(72.0, 28.0)),
+                                &mut self.config.overlay_enabled,
+                                "Show volume overlay",
                             )
-                            .on_hover_text("Save settings")
-                            .clicked()
-                        })
-                        .inner
-                    })
-                    .inner;
-                if save_clicked {
-                    self.start_save();
-                }
+                            .on_hover_text(
+                                "Show the confirmed Wave Link level after a volume change",
+                            );
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                accent_checkbox(
+                                    ui,
+                                    self.accent,
+                                    &mut self.config.overlay_show_target_name,
+                                    "Show channel or mix name",
+                                )
+                            })
+                            .inner
+                            .on_hover_text("Display the affected target above the level");
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                ui.label("Scale");
+                                percent_slider(ui, &mut self.config.overlay_scale, 0.5..=2.0, 100.0)
+                            })
+                            .inner
+                            .on_hover_text("Resize the overlay from 50% to 200%");
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                ui.label("Icon size");
+                                percent_slider(
+                                    ui,
+                                    &mut self.config.overlay_icon_scale,
+                                    0.5..=1.5,
+                                    100.0,
+                                )
+                            })
+                            .inner
+                            .on_hover_text("Resize only the channel or mix icon");
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                ui.label("Text size");
+                                percent_slider(
+                                    ui,
+                                    &mut self.config.overlay_font_scale,
+                                    0.5..=1.5,
+                                    100.0,
+                                )
+                            })
+                            .inner
+                            .on_hover_text("Resize the overlay name and percentage");
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                ui.label("Font");
+                                egui::ComboBox::from_id_salt("overlay-font")
+                                    .width(168.0)
+                                    .selected_text(
+                                        egui::RichText::new(font_display_name(
+                                            &self.config.overlay_font_family,
+                                        ))
+                                        .color(egui::Color32::WHITE),
+                                    )
+                                    .height(260.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.config.overlay_font_family,
+                                            "system".to_owned(),
+                                            "Windows default",
+                                        );
+                                        for font in installed_fonts() {
+                                            ui.selectable_value(
+                                                &mut self.config.overlay_font_family,
+                                                font.name.clone(),
+                                                &font.name,
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                                ui.label("Hide delay");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.config.overlay_hide_delay_seconds,
+                                    )
+                                    .range(0.1..=10.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" s"),
+                                )
+                            })
+                            .inner
+                            .on_hover_text(
+                                "Seconds after the last volume change; decimals are allowed",
+                            );
+                        });
+                        ui.add_space(8.0);
+                        let save_clicked = ui
+                            .horizontal(|ui| {
+                                accent_checkbox(
+                                    ui,
+                                    self.accent,
+                                    &mut self.autostart,
+                                    "Start with Windows",
+                                )
+                                .on_hover_text("Start automatically after signing in to Windows");
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if footer_link_button(
+                                            ui,
+                                            self.accent,
+                                            egui::include_image!("../assets/github.svg"),
+                                            "WaveKeys on GitHub",
+                                            18.0,
+                                        ) {
+                                            open_url("https://github.com/Wuerfelhusten/WaveKeys");
+                                        }
+                                        if footer_link_button(
+                                            ui,
+                                            self.accent,
+                                            egui::include_image!("../assets/kofi.svg"),
+                                            "Ko-fi: wuerfelhusten",
+                                            19.8,
+                                        ) {
+                                            open_url("https://ko-fi.com/wuerfelhusten");
+                                        }
+                                        ui.add_space(6.0);
+                                        let saving = self.save_receiver.is_some();
+                                        ui.add_enabled(
+                                            self.is_dirty() && !saving,
+                                            egui::Button::new(if saving {
+                                                "Saving..."
+                                            } else {
+                                                "Save"
+                                            })
+                                            .min_size(egui::vec2(72.0, 28.0)),
+                                        )
+                                        .on_hover_text("Save settings")
+                                        .clicked()
+                                    },
+                                )
+                                .inner
+                            })
+                            .inner;
+                        if save_clicked {
+                            self.start_save();
+                        }
+                    });
             });
     }
 }

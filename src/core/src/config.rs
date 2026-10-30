@@ -35,6 +35,8 @@ pub struct Config {
     pub step_percent: f32,
     /// Mix changed by hook commands.
     pub target_mix: MixTarget,
+    /// Explicit Wave Link mix IDs controlled in global mode.
+    pub target_mix_ids: Vec<String>,
     /// Scope used for media-key volume and mute commands.
     pub control_scope: ControlScope,
     /// Whether successful volume changes display the on-screen overlay.
@@ -72,6 +74,7 @@ impl Default for Config {
         Self {
             step_percent: 3.0,
             target_mix: MixTarget::Monitor,
+            target_mix_ids: Vec::new(),
             control_scope: ControlScope::Focus,
             overlay_enabled: true,
             overlay_show_target_name: true,
@@ -219,6 +222,13 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn old_config_keeps_legacy_single_mix_selection() {
+        let config: Config = toml::from_str("target_mix = \"stream\"\n").unwrap();
+        assert_eq!(config.target_mix, MixTarget::Stream);
+        assert!(config.target_mix_ids.is_empty());
     }
 
     #[test]

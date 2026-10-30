@@ -299,33 +299,7 @@ impl WaveLinkClient {
             .ok_or_else(|| {
                 WaveLinkError::InvalidResponse("requested Wave Link mix is absent".to_owned())
             })?;
-        let id = mix
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| WaveLinkError::InvalidResponse("mix has no id".to_owned()))?
-            .to_owned();
-        let level = mix
-            .get("level")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| WaveLinkError::InvalidResponse("mix has no level".to_owned()))?
-            as f32;
-        let name = mix
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("Mix")
-            .to_owned();
-        let icon = mix
-            .pointer("/image/name")
-            .and_then(Value::as_str)
-            .map(|name| VolumeTargetIcon::Named(name.to_owned()))
-            .unwrap_or(VolumeTargetIcon::None);
-        Ok((
-            id,
-            level,
-            mix.get("isMuted").and_then(Value::as_bool).unwrap_or(false),
-            name,
-            icon,
-        ))
+        parse_mix(mix)
     }
 }
 
@@ -466,6 +440,56 @@ impl WaveLinkBackend {
     }
 }
 
+type MixState = (String, f32, bool, String, VolumeTargetIcon);
+
+fn parse_mix(mix: &Value) -> Result<MixState, WaveLinkError> {
+    let id = mix
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WaveLinkError::InvalidResponse("mix has no id".to_owned()))?
+        .to_owned();
+    let level = mix
+        .get("level")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| WaveLinkError::InvalidResponse("mix has no level".to_owned()))?
+        as f32;
+    let name = mix
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Mix")
+        .to_owned();
+    let icon = mix
+        .pointer("/image/name")
+        .and_then(Value::as_str)
+        .map(|name| VolumeTargetIcon::Named(name.to_owned()))
+        .unwrap_or(VolumeTargetIcon::None);
+    Ok((
+        id,
+        level,
+        mix.get("isMuted").and_then(Value::as_bool).unwrap_or(false),
+        name,
+        icon,
+    ))
+}
+
+fn select_mixes(response: &Value, ids: &[String]) -> Result<Vec<MixState>, WaveLinkError> {
+    let mixes = response
+        .get("mixes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WaveLinkError::InvalidResponse("mix list is absent".into()))?;
+    ids.iter()
+        .map(|id| {
+            let mix = mixes
+                .iter()
+                .find(|mix| mix.get("id").and_then(Value::as_str) == Some(id))
+                .ok_or_else(|| {
+                    WaveLinkError::InvalidResponse(format!("selected mix {id} is absent"))
+                })?;
+            parse_mix(mix)
+        })
+        .collect()
+}
+
 fn map_error(error: WaveLinkError) -> VolumeError {
     match error {
         WaveLinkError::RpcTimeout => VolumeError::Timeout,
@@ -536,16 +560,29 @@ impl VolumeBackend for WaveLinkBackend {
         &self,
         delta: f32,
         target: MixTarget,
+        mix_ids: &[String],
     ) -> Result<VolumeUpdate, VolumeError> {
         let mut guard = self.client().await?;
         let client = guard.as_mut().expect("client initialized");
-        let (mix_id, level, muted, target_name, icon) =
-            client.selected_mix(target).await.map_err(map_error)?;
+        let mixes = if mix_ids.is_empty() {
+            vec![client.selected_mix(target).await.map_err(map_error)?]
+        } else {
+            let response = client
+                .call("getMixes", Value::Null)
+                .await
+                .map_err(map_error)?;
+            select_mixes(&response, mix_ids).map_err(map_error)?
+        };
+        for (mix_id, level, muted, _, _) in &mixes {
+            let result = adjust_percent(level * 100.0, delta) / 100.0;
+            client
+                .call("setMix", global_mix_level_params(mix_id, result, *muted))
+                .await
+                .map_err(map_error)?;
+        }
+        let (_, level, muted, target_name, icon) =
+            mixes.into_iter().next().expect("selection is nonempty");
         let result = adjust_percent(level * 100.0, delta) / 100.0;
-        client
-            .call("setMix", global_mix_level_params(&mix_id, result, muted))
-            .await
-            .map_err(map_error)?;
         Ok(VolumeUpdate {
             percent: result * 100.0,
             target_name,
@@ -560,19 +597,31 @@ impl VolumeBackend for WaveLinkBackend {
         })
     }
 
-    async fn toggle_mute_global_mix(&self, target: MixTarget) -> Result<VolumeUpdate, VolumeError> {
+    async fn toggle_mute_global_mix(
+        &self,
+        target: MixTarget,
+        mix_ids: &[String],
+    ) -> Result<VolumeUpdate, VolumeError> {
         let mut guard = self.client().await?;
         let client = guard.as_mut().expect("client initialized");
-        let (mix_id, level, muted, target_name, icon) =
-            client.selected_mix(target).await.map_err(map_error)?;
-        let new_mute = !muted;
-        client
-            .call(
-                "setMix",
-                json!({ "id": mix_id, "isMuted": new_mute, "level": level }),
-            )
-            .await
-            .map_err(map_error)?;
+        let mixes = if mix_ids.is_empty() {
+            vec![client.selected_mix(target).await.map_err(map_error)?]
+        } else {
+            let response = client
+                .call("getMixes", Value::Null)
+                .await
+                .map_err(map_error)?;
+            select_mixes(&response, mix_ids).map_err(map_error)?
+        };
+        let new_mute = mixes.iter().any(|mix| !mix.2);
+        for (mix_id, level, _, _, _) in &mixes {
+            client
+                .call("setMix", global_mix_level_params(mix_id, *level, new_mute))
+                .await
+                .map_err(map_error)?;
+        }
+        let (_, level, _, target_name, icon) =
+            mixes.into_iter().next().expect("selection is nonempty");
         Ok(VolumeUpdate {
             percent: level * 100.0,
             target_name,
@@ -613,6 +662,21 @@ pub fn reconnect_delay(initial: Duration, maximum: Duration, attempt: u32) -> Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_mix_selection_uses_ids_and_preserves_order() {
+        let response = json!({"mixes": [
+            {"id":"a", "name":"Renamed", "level":0.99, "isMuted":false},
+            {"id":"b", "name":"Other", "level":0.01, "isMuted":true},
+            {"id":"c", "name":"TV", "level":0.5, "isMuted":false}
+        ]});
+        let mixes = select_mixes(&response, &["b".into(), "a".into()]).unwrap();
+        assert_eq!(
+            mixes.iter().map(|m| m.0.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert!(select_mixes(&response, &["missing".into()]).is_err());
+    }
 
     #[test]
     fn reconnect_backoff_is_capped() {

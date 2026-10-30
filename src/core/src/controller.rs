@@ -90,7 +90,7 @@ impl<B: VolumeBackend> Controller<B> {
                 }
                 ControlScope::Global => {
                     self.backend
-                        .adjust_global_mix(config.step_percent, target)
+                        .adjust_global_mix(config.step_percent, target, &config.target_mix_ids)
                         .await?
                 }
             },
@@ -102,7 +102,7 @@ impl<B: VolumeBackend> Controller<B> {
                 }
                 ControlScope::Global => {
                     self.backend
-                        .adjust_global_mix(-config.step_percent, target)
+                        .adjust_global_mix(-config.step_percent, target, &config.target_mix_ids)
                         .await?
                 }
             },
@@ -119,14 +119,18 @@ impl<B: VolumeBackend> Controller<B> {
                     }
                     ControlScope::Global => {
                         self.backend
-                            .adjust_global_mix(delta_percent, target)
+                            .adjust_global_mix(delta_percent, target, &[])
                             .await?
                     }
                 }
             }
             AppCommand::ToggleMute => match config.control_scope {
                 ControlScope::Focus => self.backend.toggle_mute_current_app(target).await?,
-                ControlScope::Global => self.backend.toggle_mute_global_mix(target).await?,
+                ControlScope::Global => {
+                    self.backend
+                        .toggle_mute_global_mix(target, &config.target_mix_ids)
+                        .await?
+                }
             },
             AppCommand::SetHookPaused(_) | AppCommand::Shutdown => return Ok(()),
         };

@@ -5,7 +5,7 @@
 </p>
 
 WaveKeys is a lightweight Windows tray application that routes the system media keys to Elgato Wave Link. It can adjust the channel assigned to the focused application or control an entire Wave Link mix.
-
+ 
 ## Features
 
 - Global volume up, volume down, and mute shortcuts

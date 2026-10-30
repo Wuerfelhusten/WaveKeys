@@ -44,7 +44,9 @@ fn render_icon(tree: &resvg::Tree, size: u32) -> Pixmap {
 
 fn unpremultiply(pixels: &[u8]) -> Vec<u8> {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| {
             let alpha = pixel[3];
             if alpha == 0 {
